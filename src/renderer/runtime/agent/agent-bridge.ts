@@ -5,8 +5,8 @@
  * but the live config tree / validator / stores live here in the renderer.
  * This module answers structured queries that arrive over the MessagePort the
  * package opens to us (see App.svelte's "agent-bridge-ready" handler). Read /
- * observe / validate methods are unguarded. The one mutating method,
- * write_script, re-validates server-side and then stages a diff for explicit
+ * observe / validate methods are unguarded. The mutating methods (write_script,
+ * send_immediate) re-validate server-side and then stage the change for explicit
  * human approval (stageApproval) — nothing reaches a device without it.
  *
  * Wire protocol (package -> renderer): { id, method, params }
@@ -29,10 +29,12 @@ import { getFunctionReference, scopeWarnings } from "./grid-context";
 import { agent_activity } from "./agent-activity.store";
 
 interface ApprovalRequest {
+  title: string;
   targetLabel: string;
-  oldScript: string;
+  oldScript?: string;
   newScript: string;
   warnings: string[];
+  approveLabel: string;
 }
 
 /**
@@ -197,10 +199,12 @@ async function handle(
       agent_activity.log({ kind: "write-proposed", target: targetLabel });
 
       const decision = await stageApproval({
+        title: "AI agent wants to write a script",
         targetLabel,
         oldScript,
         newScript: normalized,
         warnings,
+        approveLabel: "Approve & apply",
       });
       if (!decision.approved) {
         agent_activity.log({ kind: "write-rejected", target: targetLabel });
@@ -231,6 +235,64 @@ async function handle(
         message: `AI agent applied a script to element ${element}, event ${event}.`,
       });
       return { applied: true, target: { dx, dy, page, element, event } };
+    }
+
+    case "send_immediate": {
+      const raw = String(params.script ?? "");
+      const dx = typeof params.dx === "number" ? params.dx : -127;
+      const dy = typeof params.dy === "number" ? params.dy : -127;
+      // Ensure there is an active connection to run on.
+      activeRuntime();
+
+      const v = validateScript(raw);
+      if (!v.ok) {
+        throw new Error(`Validation failed: ${v.error}`);
+      }
+
+      const targetLabel =
+        dx === -127 && dy === -127
+          ? "all connected modules"
+          : `module (${dx},${dy})`;
+
+      agent_activity.log({ kind: "exec-proposed", target: targetLabel });
+
+      const decision = await stageApproval({
+        title: "AI agent wants to run Lua on the device",
+        targetLabel,
+        newScript: raw, // no diff — this is a one-off execution
+        warnings: [],
+        approveLabel: "Approve & run",
+      });
+      if (!decision.approved) {
+        agent_activity.log({ kind: "exec-rejected", target: targetLabel });
+        return {
+          executed: false,
+          reason: "Rejected by the user in the editor.",
+        };
+      }
+
+      try {
+        // LUAExecImmediate compresses + sends SendConfigImmediate to the device.
+        runtime_manager.LUAExecImmediate(dx, dy, raw);
+      } catch (e) {
+        const detail = e instanceof Error ? e.message : String(e);
+        agent_activity.log({
+          kind: "exec-failed",
+          target: targetLabel,
+          detail,
+        });
+        throw new Error(`Execution failed: ${detail}`);
+      }
+
+      agent_activity.log({ kind: "exec-run", target: targetLabel });
+      logger.set({
+        type: "success",
+        message: `AI agent ran a one-off script on ${targetLabel}.`,
+      });
+      return {
+        executed: true,
+        note: "Use read_debug_log / read_errors to observe the result.",
+      };
     }
 
     default:

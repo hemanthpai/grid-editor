@@ -10,7 +10,11 @@ export type AgentActivityKind =
   | "write-proposed"
   | "write-applied"
   | "write-rejected"
-  | "write-failed";
+  | "write-failed"
+  | "exec-proposed"
+  | "exec-run"
+  | "exec-rejected"
+  | "exec-failed";
 
 export interface AgentActivityEntry {
   time: number;

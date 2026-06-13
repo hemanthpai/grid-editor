@@ -7,10 +7,13 @@
   // Provided by Modal.Window.show():
   export let data: Modal.Instance;
   export let request: {
+    title: string;
     targetLabel: string;
-    oldScript: string;
+    // When present, render a before/after diff; otherwise just show the script.
+    oldScript?: string;
     newScript: string;
     warnings: string[];
+    approveLabel: string;
   };
   // Called with the human's decision.
   export let decide: (approved: boolean) => void;
@@ -37,7 +40,7 @@
 
 <MoltenModal {data}>
   <div slot="content" class="w-[40rem] max-w-full">
-    <p class="text-lg font-medium">AI agent wants to write a script</p>
+    <p class="text-lg font-medium">{request.title}</p>
     <p class="pt-1 text-sm opacity-70">{request.targetLabel}</p>
 
     {#if request.warnings.length}
@@ -54,24 +57,32 @@
     {/if}
 
     <div class="mt-3 flex flex-col gap-3">
-      <div>
-        <p class="text-xs uppercase opacity-60">Current</p>
-        <pre
-          class="max-h-40 overflow-auto rounded bg-black/30 p-2 text-xs whitespace-pre-wrap">{request.oldScript ||
-            "(empty)"}</pre>
-      </div>
-      <div>
-        <p class="text-xs uppercase opacity-60">Proposed</p>
-        <pre
-          class="max-h-40 overflow-auto rounded bg-black/30 p-2 text-xs whitespace-pre-wrap">{request.newScript}</pre>
-      </div>
+      {#if request.oldScript !== undefined}
+        <div>
+          <p class="text-xs uppercase opacity-60">Current</p>
+          <pre
+            class="max-h-40 overflow-auto rounded bg-black/30 p-2 text-xs whitespace-pre-wrap">{request.oldScript ||
+              "(empty)"}</pre>
+        </div>
+        <div>
+          <p class="text-xs uppercase opacity-60">Proposed</p>
+          <pre
+            class="max-h-40 overflow-auto rounded bg-black/30 p-2 text-xs whitespace-pre-wrap">{request.newScript}</pre>
+        </div>
+      {:else}
+        <div>
+          <p class="text-xs uppercase opacity-60">Will run on device</p>
+          <pre
+            class="max-h-40 overflow-auto rounded bg-black/30 p-2 text-xs whitespace-pre-wrap">{request.newScript}</pre>
+        </div>
+      {/if}
     </div>
 
     <div class="flex flex-row justify-end pt-3 items-center gap-2">
       <MoltenPushButton click={reject} text={"Reject"} style={"normal"} />
       <MoltenPushButton
         click={approve}
-        text={"Approve & apply"}
+        text={request.approveLabel}
         style={"accept"}
       />
     </div>

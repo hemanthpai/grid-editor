@@ -36,10 +36,10 @@ index a2ffd12..27910e2 100644
            `Unhandled message type of ${
 diff --git a/src/renderer/runtime/agent/AgentApproval.svelte b/src/renderer/runtime/agent/AgentApproval.svelte
 new file mode 100644
-index 0000000..04dd95d
+index 0000000..4da9df9
 --- /dev/null
 +++ b/src/renderer/runtime/agent/AgentApproval.svelte
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,90 @@
 +<script lang="ts">
 +  import { MoltenPushButton } from "@intechstudio/grid-uikit";
 +  import MoltenModal from "../../main/modals/MoltenModal.svelte";
@@ -49,10 +49,13 @@ index 0000000..04dd95d
 +  // Provided by Modal.Window.show():
 +  export let data: Modal.Instance;
 +  export let request: {
++    title: string;
 +    targetLabel: string;
-+    oldScript: string;
++    // When present, render a before/after diff; otherwise just show the script.
++    oldScript?: string;
 +    newScript: string;
 +    warnings: string[];
++    approveLabel: string;
 +  };
 +  // Called with the human's decision.
 +  export let decide: (approved: boolean) => void;
@@ -79,7 +82,7 @@ index 0000000..04dd95d
 +
 +<MoltenModal {data}>
 +  <div slot="content" class="w-[40rem] max-w-full">
-+    <p class="text-lg font-medium">AI agent wants to write a script</p>
++    <p class="text-lg font-medium">{request.title}</p>
 +    <p class="pt-1 text-sm opacity-70">{request.targetLabel}</p>
 +
 +    {#if request.warnings.length}
@@ -96,24 +99,32 @@ index 0000000..04dd95d
 +    {/if}
 +
 +    <div class="mt-3 flex flex-col gap-3">
-+      <div>
-+        <p class="text-xs uppercase opacity-60">Current</p>
-+        <pre
-+          class="max-h-40 overflow-auto rounded bg-black/30 p-2 text-xs whitespace-pre-wrap">{request.oldScript ||
-+            "(empty)"}</pre>
-+      </div>
-+      <div>
-+        <p class="text-xs uppercase opacity-60">Proposed</p>
-+        <pre
-+          class="max-h-40 overflow-auto rounded bg-black/30 p-2 text-xs whitespace-pre-wrap">{request.newScript}</pre>
-+      </div>
++      {#if request.oldScript !== undefined}
++        <div>
++          <p class="text-xs uppercase opacity-60">Current</p>
++          <pre
++            class="max-h-40 overflow-auto rounded bg-black/30 p-2 text-xs whitespace-pre-wrap">{request.oldScript ||
++              "(empty)"}</pre>
++        </div>
++        <div>
++          <p class="text-xs uppercase opacity-60">Proposed</p>
++          <pre
++            class="max-h-40 overflow-auto rounded bg-black/30 p-2 text-xs whitespace-pre-wrap">{request.newScript}</pre>
++        </div>
++      {:else}
++        <div>
++          <p class="text-xs uppercase opacity-60">Will run on device</p>
++          <pre
++            class="max-h-40 overflow-auto rounded bg-black/30 p-2 text-xs whitespace-pre-wrap">{request.newScript}</pre>
++        </div>
++      {/if}
 +    </div>
 +
 +    <div class="flex flex-row justify-end pt-3 items-center gap-2">
 +      <MoltenPushButton click={reject} text={"Reject"} style={"normal"} />
 +      <MoltenPushButton
 +        click={approve}
-+        text={"Approve & apply"}
++        text={request.approveLabel}
 +        style={"accept"}
 +      />
 +    </div>
@@ -121,10 +132,10 @@ index 0000000..04dd95d
 +</MoltenModal>
 diff --git a/src/renderer/runtime/agent/agent-activity.store.ts b/src/renderer/runtime/agent/agent-activity.store.ts
 new file mode 100644
-index 0000000..611aa41
+index 0000000..bfa3faf
 --- /dev/null
 +++ b/src/renderer/runtime/agent/agent-activity.store.ts
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,39 @@
 +/**
 + * In-app activity feed for AI-agent mutations. Every guarded write the agent
 + * proposes is logged here (proposed / applied / rejected / failed) so the user
@@ -137,7 +148,11 @@ index 0000000..611aa41
 +  | "write-proposed"
 +  | "write-applied"
 +  | "write-rejected"
-+  | "write-failed";
++  | "write-failed"
++  | "exec-proposed"
++  | "exec-run"
++  | "exec-rejected"
++  | "exec-failed";
 +
 +export interface AgentActivityEntry {
 +  time: number;
@@ -162,10 +177,10 @@ index 0000000..611aa41
 +export const agent_activity = createActivity();
 diff --git a/src/renderer/runtime/agent/agent-bridge.ts b/src/renderer/runtime/agent/agent-bridge.ts
 new file mode 100644
-index 0000000..8f0001c
+index 0000000..b06dbee
 --- /dev/null
 +++ b/src/renderer/runtime/agent/agent-bridge.ts
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,326 @@
 +/**
 + * Renderer-side AI agent bridge.
 + *
@@ -173,8 +188,8 @@ index 0000000..8f0001c
 + * but the live config tree / validator / stores live here in the renderer.
 + * This module answers structured queries that arrive over the MessagePort the
 + * package opens to us (see App.svelte's "agent-bridge-ready" handler). Read /
-+ * observe / validate methods are unguarded. The one mutating method,
-+ * write_script, re-validates server-side and then stages a diff for explicit
++ * observe / validate methods are unguarded. The mutating methods (write_script,
++ * send_immediate) re-validate server-side and then stage the change for explicit
 + * human approval (stageApproval) — nothing reaches a device without it.
 + *
 + * Wire protocol (package -> renderer): { id, method, params }
@@ -197,10 +212,12 @@ index 0000000..8f0001c
 +import { agent_activity } from "./agent-activity.store";
 +
 +interface ApprovalRequest {
++  title: string;
 +  targetLabel: string;
-+  oldScript: string;
++  oldScript?: string;
 +  newScript: string;
 +  warnings: string[];
++  approveLabel: string;
 +}
 +
 +/**
@@ -365,10 +382,12 @@ index 0000000..8f0001c
 +      agent_activity.log({ kind: "write-proposed", target: targetLabel });
 +
 +      const decision = await stageApproval({
++        title: "AI agent wants to write a script",
 +        targetLabel,
 +        oldScript,
 +        newScript: normalized,
 +        warnings,
++        approveLabel: "Approve & apply",
 +      });
 +      if (!decision.approved) {
 +        agent_activity.log({ kind: "write-rejected", target: targetLabel });
@@ -399,6 +418,64 @@ index 0000000..8f0001c
 +        message: `AI agent applied a script to element ${element}, event ${event}.`,
 +      });
 +      return { applied: true, target: { dx, dy, page, element, event } };
++    }
++
++    case "send_immediate": {
++      const raw = String(params.script ?? "");
++      const dx = typeof params.dx === "number" ? params.dx : -127;
++      const dy = typeof params.dy === "number" ? params.dy : -127;
++      // Ensure there is an active connection to run on.
++      activeRuntime();
++
++      const v = validateScript(raw);
++      if (!v.ok) {
++        throw new Error(`Validation failed: ${v.error}`);
++      }
++
++      const targetLabel =
++        dx === -127 && dy === -127
++          ? "all connected modules"
++          : `module (${dx},${dy})`;
++
++      agent_activity.log({ kind: "exec-proposed", target: targetLabel });
++
++      const decision = await stageApproval({
++        title: "AI agent wants to run Lua on the device",
++        targetLabel,
++        newScript: raw, // no diff — this is a one-off execution
++        warnings: [],
++        approveLabel: "Approve & run",
++      });
++      if (!decision.approved) {
++        agent_activity.log({ kind: "exec-rejected", target: targetLabel });
++        return {
++          executed: false,
++          reason: "Rejected by the user in the editor.",
++        };
++      }
++
++      try {
++        // LUAExecImmediate compresses + sends SendConfigImmediate to the device.
++        runtime_manager.LUAExecImmediate(dx, dy, raw);
++      } catch (e) {
++        const detail = e instanceof Error ? e.message : String(e);
++        agent_activity.log({
++          kind: "exec-failed",
++          target: targetLabel,
++          detail,
++        });
++        throw new Error(`Execution failed: ${detail}`);
++      }
++
++      agent_activity.log({ kind: "exec-run", target: targetLabel });
++      logger.set({
++        type: "success",
++        message: `AI agent ran a one-off script on ${targetLabel}.`,
++      });
++      return {
++        executed: true,
++        note: "Use read_debug_log / read_errors to observe the result.",
++      };
 +    }
 +
 +    default:
