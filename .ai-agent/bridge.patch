@@ -507,6 +507,59 @@ index 0000000..b06dbee
 +  // Let the package know the renderer side is live.
 +  port.postMessage({ type: "bridge-ready" });
 +}
+diff --git a/src/renderer/runtime/agent/grid-context.test.ts b/src/renderer/runtime/agent/grid-context.test.ts
+new file mode 100644
+index 0000000..e10bcae
+--- /dev/null
++++ b/src/renderer/runtime/agent/grid-context.test.ts
+@@ -0,0 +1,47 @@
++import { test, expect, beforeAll, describe } from "vitest";
++import { initLuaFormatter } from "@intechstudio/grid-protocol";
++import { getFunctionReference, scopeWarnings } from "./grid-context";
++
++beforeAll(async () => {
++  await initLuaFormatter();
++});
++
++describe("getFunctionReference", () => {
++  test("returns scoped functions with helper text", () => {
++    const ref = getFunctionReference("encoder");
++    expect(Array.isArray(ref)).toBe(true);
++    expect(ref.length).toBeGreaterThan(0);
++    expect(ref[0]).toHaveProperty("name");
++    expect(ref[0]).toHaveProperty("key");
++  });
++
++  test("scoping changes the set (button vs encoder differ)", () => {
++    const enc = new Set(getFunctionReference("encoder").map((f) => f.key));
++    const btn = new Set(getFunctionReference("button").map((f) => f.key));
++    const onlyEnc = [...enc].filter((k) => !btn.has(k));
++    const onlyBtn = [...btn].filter((k) => !enc.has(k));
++    expect(onlyEnc.length + onlyBtn.length).toBeGreaterThan(0);
++  });
++
++  test("undefined scope is a superset of any single scope", () => {
++    const all = getFunctionReference(undefined).length;
++    const enc = getFunctionReference("encoder").length;
++    expect(all).toBeGreaterThanOrEqual(enc);
++  });
++});
++
++describe("scopeWarnings", () => {
++  test("no warnings without a scope", () => {
++    expect(scopeWarnings("self:led_set()", undefined)).toEqual([]);
++  });
++
++  test("flags an other-scope function called in this scope", () => {
++    const enc = new Set(getFunctionReference("encoder").map((f) => f.name));
++    const other = getFunctionReference(undefined)
++      .map((f) => f.name)
++      .find((n) => !enc.has(n));
++    if (!other) return; // every function valid for encoder on this build
++    const warnings = scopeWarnings(`self:${other}()`, "encoder");
++    expect(warnings.some((w) => w.includes(other))).toBe(true);
++  });
++});
 diff --git a/src/renderer/runtime/agent/grid-context.ts b/src/renderer/runtime/agent/grid-context.ts
 new file mode 100644
 index 0000000..39a4d63
@@ -596,12 +649,58 @@ index 0000000..39a4d63
 +  }
 +  return warnings;
 +}
+diff --git a/src/renderer/runtime/agent/validate.test.ts b/src/renderer/runtime/agent/validate.test.ts
+new file mode 100644
+index 0000000..0dde699
+--- /dev/null
++++ b/src/renderer/runtime/agent/validate.test.ts
+@@ -0,0 +1,40 @@
++import { test, expect, beforeAll, describe } from "vitest";
++import { initLuaFormatter, grid } from "@intechstudio/grid-protocol";
++import { validateScript } from "./validate";
++
++// GridScript's parser needs the Lua formatter initialised first (same as the
++// editor does at startup).
++beforeAll(async () => {
++  await initLuaFormatter();
++});
++
++describe("validateScript", () => {
++  test("accepts a simple valid statement", () => {
++    const r = validateScript("local x = 1");
++    expect(r.ok).toBe(true);
++    expect(r.compressedLength).toBeGreaterThan(0);
++    expect(r.maxLength).toBeGreaterThan(0);
++  });
++
++  test("rejects a syntax error", () => {
++    const r = validateScript("local x =");
++    expect(r.ok).toBe(false);
++    expect(r.error).toBeTruthy();
++  });
++
++  test("rejects over-length scripts", () => {
++    const max = grid.getProperty("CONFIG_LENGTH");
++    const big = "a=1;".repeat(max); // well over the cap
++    const r = validateScript(big);
++    expect(r.ok).toBe(false);
++    expect(r.error).toMatch(/too long/i);
++  });
++
++  test("rejects forbidden identifiers", () => {
++    const forbiddens = grid.lua_function_forbiddens();
++    if (forbiddens.length === 0) return; // nothing forbidden on this build
++    const r = validateScript(`${forbiddens[0]}()`);
++    expect(r.ok).toBe(false);
++    expect(r.forbidden).toContain(forbiddens[0]);
++  });
++});
 diff --git a/src/renderer/runtime/agent/validate.ts b/src/renderer/runtime/agent/validate.ts
 new file mode 100644
-index 0000000..f164b97
+index 0000000..5bb4706
 --- /dev/null
 +++ b/src/renderer/runtime/agent/validate.ts
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,84 @@
 +/**
 + * Shared intech_lua validator for the AI agent bridge.
 + *
@@ -611,7 +710,11 @@ index 0000000..f164b97
 + * never touches hardware.
 + */
 +import { GridScript, grid } from "@intechstudio/grid-protocol";
-+import { Grid } from "../../lib/_utils";
++
++/** Hard cap on a config's length (same source the editor uses). */
++function maxScriptLength(): number {
++  return grid.getProperty("CONFIG_LENGTH");
++}
 +
 +export interface ValidateResult {
 +  ok: boolean;
@@ -644,7 +747,7 @@ index 0000000..f164b97
 +}
 +
 +export function validateScript(script: string): ValidateResult {
-+  const maxLength = Grid.Protocol.maxScriptLength;
++  const maxLength = maxScriptLength();
 +  const hits = findForbidden(script);
 +
 +  let compressed: string;

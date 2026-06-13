@@ -7,7 +7,11 @@
  * never touches hardware.
  */
 import { GridScript, grid } from "@intechstudio/grid-protocol";
-import { Grid } from "../../lib/_utils";
+
+/** Hard cap on a config's length (same source the editor uses). */
+function maxScriptLength(): number {
+  return grid.getProperty("CONFIG_LENGTH");
+}
 
 export interface ValidateResult {
   ok: boolean;
@@ -40,7 +44,7 @@ function findForbidden(script: string): string[] {
 }
 
 export function validateScript(script: string): ValidateResult {
-  const maxLength = Grid.Protocol.maxScriptLength;
+  const maxLength = maxScriptLength();
   const hits = findForbidden(script);
 
   let compressed: string;
