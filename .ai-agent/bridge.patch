@@ -1,0 +1,337 @@
+diff --git a/src/renderer/App.svelte b/src/renderer/App.svelte
+index a2ffd12..27910e2 100644
+--- a/src/renderer/App.svelte
++++ b/src/renderer/App.svelte
+@@ -44,6 +44,7 @@
+   import "redefine-custom-elements";
+   import { runtime_manager } from "./runtime/runtime-manager.store";
+   import { get } from "svelte/store";
++  import { setupAgentBridge } from "./runtime/agent/agent-bridge";
+ 
+   let shapeSelected;
+   let colorSelected;
+@@ -243,6 +244,23 @@
+         console.log(`Package error: ${JSON.stringify(data)}`);
+         break;
+       }
++      case "agent-bridge-ready": {
++        // The AI agent package (package-ai-agent) asks us to open a direct
++        // MessagePort so its MCP server can answer read-only runtime queries.
++        if (typeof window.createPackageMessagePort === "function") {
++          const targetId = data.packageId ?? "package-ai-agent";
++          const port = window.createPackageMessagePort(
++            targetId,
++            "agent-bridge",
++          );
++          setupAgentBridge(port);
++        } else {
++          console.warn(
++            "agent-bridge-ready received before createPackageMessagePort was ready",
++          );
++        }
++        break;
++      }
+       default: {
+         console.info(
+           `Unhandled message type of ${
+diff --git a/src/renderer/runtime/agent/agent-bridge.ts b/src/renderer/runtime/agent/agent-bridge.ts
+new file mode 100644
+index 0000000..1202ce6
+--- /dev/null
++++ b/src/renderer/runtime/agent/agent-bridge.ts
+@@ -0,0 +1,146 @@
++/**
++ * Renderer-side AI agent bridge.
++ *
++ * The external `package-ai-agent` hosts an MCP server in the package process,
++ * but the live config tree / validator / stores live here in the renderer.
++ * This module answers structured, READ-ONLY queries that arrive over the
++ * MessagePort the package opens to us (see App.svelte's "agent-bridge-ready"
++ * handler). No mutating methods are implemented — writing to hardware is gated
++ * behind a later phase + an approval gate.
++ *
++ * Wire protocol (package -> renderer): { id, method, params }
++ *               (renderer -> package): { id, ok: true, result }
++ *                                    | { id, ok: false, error }
++ */
++import { get } from "svelte/store";
++import { NumberToEventType } from "@intechstudio/grid-protocol";
++import { runtime_manager } from "../runtime-manager.store";
++import {
++  debug_monitor_store,
++  lua_error_store,
++} from "../../main/panels/DebugMonitor/DebugMonitor.store";
++import { validateScript } from "./validate";
++import { getFunctionReference } from "./grid-context";
++
++interface AgentRequest {
++  id: number;
++  method: string;
++  params?: Record<string, any>;
++}
++
++function activeRuntime(): any {
++  const rt = get(runtime_manager)?.active?.runtime;
++  if (!rt) throw new Error("No active Grid connection.");
++  return rt;
++}
++
++async function handle(
++  method: string,
++  params: Record<string, any> = {},
++): Promise<unknown> {
++  switch (method) {
++    case "list_modules": {
++      const rt = activeRuntime();
++      return rt.modules.map((m: any) => ({
++        dx: m.dx,
++        dy: m.dy,
++        type: m.type,
++        architecture: m.architecture,
++        fwVersion: m.fwVersion,
++        pages: (m.pages ?? []).map((p: any) => p.pageNumber),
++      }));
++    }
++
++    case "list_elements": {
++      const { dx, dy, page = 0 } = params;
++      const p = activeRuntime().findPage(dx, dy, page);
++      if (!p) throw new Error(`No page ${page} on module (${dx},${dy}).`);
++      return p.control_elements.map((el: any) => ({
++        element: el.elementIndex,
++        type: el.type,
++        name: el.name,
++      }));
++    }
++
++    case "list_events": {
++      const { dx, dy, page = 0, element } = params;
++      const el = activeRuntime().findElement(dx, dy, page, element);
++      if (!el)
++        throw new Error(`No element ${element} on (${dx},${dy}) page ${page}.`);
++      return el.events.map((ev: any) => ({
++        event: ev.type,
++        name: NumberToEventType(ev.type),
++        state: ev.state,
++      }));
++    }
++
++    case "get_config": {
++      const { dx, dy, page = 0, element, event } = params;
++      const rt = activeRuntime();
++      const ev = rt.findEvent(dx, dy, page, element, event);
++      if (!ev) {
++        throw new Error(
++          `Event not found: (${dx},${dy}) page ${page} element ${element} event ${event}.`,
++        );
++      }
++      let script = ev.toLua();
++      // Best-effort: fetch from device if this event hasn't been loaded yet.
++      if (!script && typeof ev.load === "function") {
++        try {
++          await ev.load();
++          script = ev.toLua();
++        } catch {
++          /* leave script as-is */
++        }
++      }
++      const el = rt.findElement(dx, dy, page, element);
++      return { script, scope: el?.type, stored: ev.stored, state: ev.state };
++    }
++
++    case "get_function_reference":
++      return getFunctionReference(params.scope);
++
++    case "validate_script":
++      return validateScript(String(params.script ?? ""));
++
++    case "read_debug_log": {
++      const limit = Number(params.limit ?? 50);
++      const entries = get(debug_monitor_store) as unknown[];
++      return entries.slice(-limit);
++    }
++
++    case "read_errors": {
++      const limit = Number(params.limit ?? 15);
++      const entries = get(lua_error_store) as unknown[];
++      return entries.slice(-limit);
++    }
++
++    default:
++      throw new Error(`Unknown agent method: ${method}`);
++  }
++}
++
++/**
++ * Wire up a MessagePort (opened by the renderer to the agent package) as a
++ * request/response server.
++ */
++export function setupAgentBridge(port: MessagePort): void {
++  port.onmessage = async (e: MessageEvent) => {
++    const req = e.data as AgentRequest;
++    if (!req || typeof req.id !== "number" || typeof req.method !== "string")
++      return;
++    try {
++      const result = await handle(req.method, req.params ?? {});
++      port.postMessage({ id: req.id, ok: true, result });
++    } catch (err) {
++      port.postMessage({
++        id: req.id,
++        ok: false,
++        error: err instanceof Error ? err.message : String(err),
++      });
++    }
++  };
++  port.start?.();
++  // Let the package know the renderer side is live.
++  port.postMessage({ type: "bridge-ready" });
++}
+diff --git a/src/renderer/runtime/agent/grid-context.ts b/src/renderer/runtime/agent/grid-context.ts
+new file mode 100644
+index 0000000..a44b75f
+--- /dev/null
++++ b/src/renderer/runtime/agent/grid-context.ts
+@@ -0,0 +1,57 @@
++/**
++ * Scope-aware intech_lua function reference for the AI agent bridge.
++ *
++ * Reproduces the scope-filtering branches monaco.ts uses when building Lua
++ * completions, so get_function_reference(scope) gives the agent exactly the
++ * functions valid for an element type (its grounding corpus).
++ */
++import { grid, ElementType } from "@intechstudio/grid-protocol";
++
++const ELEMENT_TYPE_MAPPING: Record<string, string> = {
++  GRID_LUA_FNC_EP: "endless",
++  GRID_LUA_FNC_E: "encoder",
++  GRID_LUA_FNC_B: "button",
++  GRID_LUA_FNC_P: "potmeter",
++  GRID_LUA_FNC_L: "lcd",
++};
++
++export interface FunctionRef {
++  key: string;
++  name: string;
++  helper?: string;
++}
++
++/**
++ * @param scope element type (e.g. "button"); undefined returns the full list.
++ */
++export function getFunctionReference(scope?: string): FunctionRef[] {
++  const out: FunctionRef[] = [];
++
++  for (const [key, value] of grid.lua_function_to_human_map()) {
++    const prefix = Object.keys(ELEMENT_TYPE_MAPPING).find((p) =>
++      key.startsWith(p),
++    );
++
++    let include = false;
++    if (
++      prefix &&
++      (scope === ELEMENT_TYPE_MAPPING[prefix] || scope === undefined)
++    ) {
++      // Scoped element function matching the requested element type.
++      include = true;
++    } else if (scope === ElementType.SYSTEM || !scope) {
++      // System scope (or unscoped) sees element[0] functions.
++      include = true;
++    } else if (!prefix) {
++      // Global (non-element-scoped) function — always available.
++      include = true;
++    }
++
++    if (include) {
++      const helper = grid.get_lua_function_helper(key);
++      out.push({ key, name: value, helper: helper ?? undefined });
++    }
++  }
++
++  return out;
++}
+diff --git a/src/renderer/runtime/agent/validate.ts b/src/renderer/runtime/agent/validate.ts
+new file mode 100644
+index 0000000..f164b97
+--- /dev/null
++++ b/src/renderer/runtime/agent/validate.ts
+@@ -0,0 +1,80 @@
++/**
++ * Shared intech_lua validator for the AI agent bridge.
++ *
++ * Mirrors the validate + length + forbidden-identifier logic that
++ * Monaco.svelte / monaco.ts apply when editing a script, so the agent's
++ * validate_script loop uses the SAME real parser the editor does. Read-only —
++ * never touches hardware.
++ */
++import { GridScript, grid } from "@intechstudio/grid-protocol";
++import { Grid } from "../../lib/_utils";
++
++export interface ValidateResult {
++  ok: boolean;
++  compressedLength?: number;
++  maxLength: number;
++  error?: string;
++  forbidden?: string[];
++}
++
++let _forbiddens: string[] | null = null;
++function forbiddens(): string[] {
++  if (_forbiddens === null) {
++    try {
++      _forbiddens = grid.lua_function_forbiddens() ?? [];
++    } catch {
++      _forbiddens = [];
++    }
++  }
++  return _forbiddens;
++}
++
++function escapeRegExp(s: string): string {
++  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
++}
++
++function findForbidden(script: string): string[] {
++  return forbiddens().filter((f) =>
++    new RegExp(`\\b${escapeRegExp(f)}\\b`).test(script),
++  );
++}
++
++export function validateScript(script: string): ValidateResult {
++  const maxLength = Grid.Protocol.maxScriptLength;
++  const hits = findForbidden(script);
++
++  let compressed: string;
++  try {
++    compressed = GridScript.compressScript(script);
++  } catch (e) {
++    return {
++      ok: false,
++      maxLength,
++      error: e instanceof Error ? e.message : String(e),
++      forbidden: hits.length ? hits : undefined,
++    };
++  }
++
++  const compressedLength = compressed.length;
++  if (compressedLength >= maxLength) {
++    return {
++      ok: false,
++      compressedLength,
++      maxLength,
++      error: `Script too long: compressed length ${compressedLength} >= limit ${maxLength}.`,
++      forbidden: hits.length ? hits : undefined,
++    };
++  }
++
++  if (hits.length) {
++    return {
++      ok: false,
++      compressedLength,
++      maxLength,
++      error: `Uses forbidden identifier(s): ${hits.join(", ")}.`,
++      forbidden: hits,
++    };
++  }
++
++  return { ok: true, compressedLength, maxLength };
++}
