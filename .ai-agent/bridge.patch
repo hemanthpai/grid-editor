@@ -34,35 +34,199 @@ index a2ffd12..27910e2 100644
        default: {
          console.info(
            `Unhandled message type of ${
+diff --git a/src/renderer/runtime/agent/AgentApproval.svelte b/src/renderer/runtime/agent/AgentApproval.svelte
+new file mode 100644
+index 0000000..04dd95d
+--- /dev/null
++++ b/src/renderer/runtime/agent/AgentApproval.svelte
+@@ -0,0 +1,79 @@
++<script lang="ts">
++  import { MoltenPushButton } from "@intechstudio/grid-uikit";
++  import MoltenModal from "../../main/modals/MoltenModal.svelte";
++  import { Modal } from "../../main/modals/modal.store";
++  import { onDestroy } from "svelte";
++
++  // Provided by Modal.Window.show():
++  export let data: Modal.Instance;
++  export let request: {
++    targetLabel: string;
++    oldScript: string;
++    newScript: string;
++    warnings: string[];
++  };
++  // Called with the human's decision.
++  export let decide: (approved: boolean) => void;
++  // Called if the dialog closes without an explicit decision (escape / click-out).
++  export let onClosed: () => void = () => {};
++
++  let acted = false;
++
++  function approve() {
++    acted = true;
++    decide(true);
++    data.close();
++  }
++  function reject() {
++    acted = true;
++    decide(false);
++    data.close();
++  }
++
++  onDestroy(() => {
++    if (!acted) onClosed();
++  });
++</script>
++
++<MoltenModal {data}>
++  <div slot="content" class="w-[40rem] max-w-full">
++    <p class="text-lg font-medium">AI agent wants to write a script</p>
++    <p class="pt-1 text-sm opacity-70">{request.targetLabel}</p>
++
++    {#if request.warnings.length}
++      <div
++        class="mt-3 rounded border border-yellow-500/50 bg-yellow-500/10 p-2 text-sm"
++      >
++        <p class="font-medium">Scope warnings</p>
++        <ul class="list-disc pl-5">
++          {#each request.warnings as w}
++            <li>{w}</li>
++          {/each}
++        </ul>
++      </div>
++    {/if}
++
++    <div class="mt-3 flex flex-col gap-3">
++      <div>
++        <p class="text-xs uppercase opacity-60">Current</p>
++        <pre
++          class="max-h-40 overflow-auto rounded bg-black/30 p-2 text-xs whitespace-pre-wrap">{request.oldScript ||
++            "(empty)"}</pre>
++      </div>
++      <div>
++        <p class="text-xs uppercase opacity-60">Proposed</p>
++        <pre
++          class="max-h-40 overflow-auto rounded bg-black/30 p-2 text-xs whitespace-pre-wrap">{request.newScript}</pre>
++      </div>
++    </div>
++
++    <div class="flex flex-row justify-end pt-3 items-center gap-2">
++      <MoltenPushButton click={reject} text={"Reject"} style={"normal"} />
++      <MoltenPushButton
++        click={approve}
++        text={"Approve & apply"}
++        style={"accept"}
++      />
++    </div>
++  </div>
++</MoltenModal>
+diff --git a/src/renderer/runtime/agent/agent-activity.store.ts b/src/renderer/runtime/agent/agent-activity.store.ts
+new file mode 100644
+index 0000000..611aa41
+--- /dev/null
++++ b/src/renderer/runtime/agent/agent-activity.store.ts
+@@ -0,0 +1,35 @@
++/**
++ * In-app activity feed for AI-agent mutations. Every guarded write the agent
++ * proposes is logged here (proposed / applied / rejected / failed) so the user
++ * has a visible record of what the agent did. The Phase 5 "Ask the agent" panel
++ * can render this; for now outcomes also surface as editor toasts.
++ */
++import { writable } from "svelte/store";
++
++export type AgentActivityKind =
++  | "write-proposed"
++  | "write-applied"
++  | "write-rejected"
++  | "write-failed";
++
++export interface AgentActivityEntry {
++  time: number;
++  kind: AgentActivityKind;
++  target: string;
++  detail?: string;
++}
++
++function createActivity(max = 100) {
++  const store = writable<AgentActivityEntry[]>([]);
++  return {
++    ...store,
++    log(entry: Omit<AgentActivityEntry, "time">) {
++      store.update((entries) => {
++        const next = [...entries, { ...entry, time: Date.now() }];
++        return next.length > max ? next.slice(-max) : next;
++      });
++    },
++  };
++}
++
++export const agent_activity = createActivity();
 diff --git a/src/renderer/runtime/agent/agent-bridge.ts b/src/renderer/runtime/agent/agent-bridge.ts
 new file mode 100644
-index 0000000..1202ce6
+index 0000000..8f0001c
 --- /dev/null
 +++ b/src/renderer/runtime/agent/agent-bridge.ts
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,264 @@
 +/**
 + * Renderer-side AI agent bridge.
 + *
 + * The external `package-ai-agent` hosts an MCP server in the package process,
 + * but the live config tree / validator / stores live here in the renderer.
-+ * This module answers structured, READ-ONLY queries that arrive over the
-+ * MessagePort the package opens to us (see App.svelte's "agent-bridge-ready"
-+ * handler). No mutating methods are implemented — writing to hardware is gated
-+ * behind a later phase + an approval gate.
++ * This module answers structured queries that arrive over the MessagePort the
++ * package opens to us (see App.svelte's "agent-bridge-ready" handler). Read /
++ * observe / validate methods are unguarded. The one mutating method,
++ * write_script, re-validates server-side and then stages a diff for explicit
++ * human approval (stageApproval) — nothing reaches a device without it.
 + *
 + * Wire protocol (package -> renderer): { id, method, params }
 + *               (renderer -> package): { id, ok: true, result }
 + *                                    | { id, ok: false, error }
 + */
 +import { get } from "svelte/store";
-+import { NumberToEventType } from "@intechstudio/grid-protocol";
++import { NumberToEventType, GridScript } from "@intechstudio/grid-protocol";
 +import { runtime_manager } from "../runtime-manager.store";
++import { GridAction } from "../runtime";
++import { logger } from "../runtime.store";
 +import {
 +  debug_monitor_store,
 +  lua_error_store,
 +} from "../../main/panels/DebugMonitor/DebugMonitor.store";
++import { Modal } from "../../main/modals/modal.store";
++import AgentApproval from "./AgentApproval.svelte";
 +import { validateScript } from "./validate";
-+import { getFunctionReference } from "./grid-context";
++import { getFunctionReference, scopeWarnings } from "./grid-context";
++import { agent_activity } from "./agent-activity.store";
++
++interface ApprovalRequest {
++  targetLabel: string;
++  oldScript: string;
++  newScript: string;
++  warnings: string[];
++}
++
++/**
++ * Stage a write for explicit human approval: open the approval dialog and
++ * resolve only when the user decides (or closes the dialog — treated as a
++ * rejection). Nothing reaches a device until this resolves `approved: true`.
++ */
++function stageApproval(
++  request: ApprovalRequest,
++): Promise<{ approved: boolean }> {
++  return new Promise((resolve) => {
++    let settled = false;
++    const done = (approved: boolean) => {
++      if (!settled) {
++        settled = true;
++        resolve({ approved });
++      }
++    };
++    const win = new Modal.Window(AgentApproval as any);
++    win.show({
++      request,
++      decide: (approved: boolean) => done(approved),
++      onClosed: () => done(false),
++    });
++  });
++}
 +
 +interface AgentRequest {
 +  id: number;
@@ -157,6 +321,86 @@ index 0000000..1202ce6
 +      return entries.slice(-limit);
 +    }
 +
++    case "write_script": {
++      const { dx, dy, page = 0, element, event } = params;
++      const raw = String(params.script ?? "");
++      const rt = activeRuntime();
++      const ev = rt.findEvent(dx, dy, page, element, event);
++      if (!ev) {
++        throw new Error(
++          `Event not found: (${dx},${dy}) page ${page} element ${element} event ${event}.`,
++        );
++      }
++      const el = rt.findElement(dx, dy, page, element);
++      const scope: string | undefined = el?.type;
++
++      // Bare Lua has no action-block annotations; wrap it as a single code
++      // block so the runtime parser produces an action.
++      const normalized = /--\[\[@/.test(raw) ? raw : `--[[@cb]] ${raw}`;
++      const newActions = GridAction.parse(normalized);
++      if (newActions.length === 0) {
++        throw new Error(
++          "Script did not parse into any action blocks. Pass intech_lua, or the editor's --[[@short]] block form.",
++        );
++      }
++
++      // Server-side re-validation, independent of anything the agent asserts:
++      // re-run the real parser/length/forbidden check per action block.
++      const invalid = newActions
++        .map((a: any) => ({ short: a.short, ...validateScript(a.script) }))
++        .filter((b: any) => !b.ok);
++      if (invalid.length > 0) {
++        throw new Error(
++          "Validation failed: " +
++            invalid.map((b: any) => `[${b.short}] ${b.error}`).join("; "),
++        );
++      }
++
++      const targetLabel =
++        `module (${dx},${dy}) · page ${page} · element ${element}` +
++        ` (${scope ?? "?"}) · event ${event}`;
++      const oldScript = ev.toLua();
++      const warnings = scopeWarnings(raw, scope);
++
++      agent_activity.log({ kind: "write-proposed", target: targetLabel });
++
++      const decision = await stageApproval({
++        targetLabel,
++        oldScript,
++        newScript: normalized,
++        warnings,
++      });
++      if (!decision.approved) {
++        agent_activity.log({ kind: "write-rejected", target: targetLabel });
++        return {
++          applied: false,
++          reason: "Rejected by the user in the editor.",
++        };
++      }
++
++      try {
++        const current = [...ev.config];
++        if (current.length > 0) await ev.remove(...current);
++        await ev.insert(0, ...newActions);
++        await ev.sendToGrid();
++      } catch (e) {
++        const detail = e instanceof Error ? e.message : String(e);
++        agent_activity.log({
++          kind: "write-failed",
++          target: targetLabel,
++          detail,
++        });
++        throw new Error(`Apply failed: ${detail}`);
++      }
++
++      agent_activity.log({ kind: "write-applied", target: targetLabel });
++      logger.set({
++        type: "success",
++        message: `AI agent applied a script to element ${element}, event ${event}.`,
++      });
++      return { applied: true, target: { dx, dy, page, element, event } };
++    }
++
 +    default:
 +      throw new Error(`Unknown agent method: ${method}`);
 +  }
@@ -188,10 +432,10 @@ index 0000000..1202ce6
 +}
 diff --git a/src/renderer/runtime/agent/grid-context.ts b/src/renderer/runtime/agent/grid-context.ts
 new file mode 100644
-index 0000000..a44b75f
+index 0000000..39a4d63
 --- /dev/null
 +++ b/src/renderer/runtime/agent/grid-context.ts
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,83 @@
 +/**
 + * Scope-aware intech_lua function reference for the AI agent bridge.
 + *
@@ -248,6 +492,32 @@ index 0000000..a44b75f
 +  }
 +
 +  return out;
++}
++
++/**
++ * Best-effort scope check for a write: flag element-scoped functions called in
++ * the script (e.g. `self:led_set(`) that exist for some element type but NOT
++ * for the target scope. Advisory only — surfaced to the human approver, not a
++ * hard reject (the human is the final gate, and this heuristic can't be perfect).
++ */
++export function scopeWarnings(script: string, scope?: string): string[] {
++  if (!scope) return [];
++  const scoped = new Set(getFunctionReference(scope).map((f) => f.name));
++  const all = new Set(getFunctionReference(undefined).map((f) => f.name));
++
++  const warnings: string[] = [];
++  const seen = new Set<string>();
++  const callRe = /:(\w+)\s*\(/g; // method-style calls: self:fn( / element[0]:fn(
++  let match: RegExpExecArray | null;
++  while ((match = callRe.exec(script)) !== null) {
++    const fn = match[1];
++    if (seen.has(fn)) continue;
++    seen.add(fn);
++    if (all.has(fn) && !scoped.has(fn)) {
++      warnings.push(`'${fn}' is not a valid function for scope '${scope}'.`);
++    }
++  }
++  return warnings;
 +}
 diff --git a/src/renderer/runtime/agent/validate.ts b/src/renderer/runtime/agent/validate.ts
 new file mode 100644

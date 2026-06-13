@@ -55,3 +55,29 @@ export function getFunctionReference(scope?: string): FunctionRef[] {
 
   return out;
 }
+
+/**
+ * Best-effort scope check for a write: flag element-scoped functions called in
+ * the script (e.g. `self:led_set(`) that exist for some element type but NOT
+ * for the target scope. Advisory only — surfaced to the human approver, not a
+ * hard reject (the human is the final gate, and this heuristic can't be perfect).
+ */
+export function scopeWarnings(script: string, scope?: string): string[] {
+  if (!scope) return [];
+  const scoped = new Set(getFunctionReference(scope).map((f) => f.name));
+  const all = new Set(getFunctionReference(undefined).map((f) => f.name));
+
+  const warnings: string[] = [];
+  const seen = new Set<string>();
+  const callRe = /:(\w+)\s*\(/g; // method-style calls: self:fn( / element[0]:fn(
+  let match: RegExpExecArray | null;
+  while ((match = callRe.exec(script)) !== null) {
+    const fn = match[1];
+    if (seen.has(fn)) continue;
+    seen.add(fn);
+    if (all.has(fn) && !scoped.has(fn)) {
+      warnings.push(`'${fn}' is not a valid function for scope '${scope}'.`);
+    }
+  }
+  return warnings;
+}

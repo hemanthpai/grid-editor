@@ -3,24 +3,62 @@
  *
  * The external `package-ai-agent` hosts an MCP server in the package process,
  * but the live config tree / validator / stores live here in the renderer.
- * This module answers structured, READ-ONLY queries that arrive over the
- * MessagePort the package opens to us (see App.svelte's "agent-bridge-ready"
- * handler). No mutating methods are implemented — writing to hardware is gated
- * behind a later phase + an approval gate.
+ * This module answers structured queries that arrive over the MessagePort the
+ * package opens to us (see App.svelte's "agent-bridge-ready" handler). Read /
+ * observe / validate methods are unguarded. The one mutating method,
+ * write_script, re-validates server-side and then stages a diff for explicit
+ * human approval (stageApproval) — nothing reaches a device without it.
  *
  * Wire protocol (package -> renderer): { id, method, params }
  *               (renderer -> package): { id, ok: true, result }
  *                                    | { id, ok: false, error }
  */
 import { get } from "svelte/store";
-import { NumberToEventType } from "@intechstudio/grid-protocol";
+import { NumberToEventType, GridScript } from "@intechstudio/grid-protocol";
 import { runtime_manager } from "../runtime-manager.store";
+import { GridAction } from "../runtime";
+import { logger } from "../runtime.store";
 import {
   debug_monitor_store,
   lua_error_store,
 } from "../../main/panels/DebugMonitor/DebugMonitor.store";
+import { Modal } from "../../main/modals/modal.store";
+import AgentApproval from "./AgentApproval.svelte";
 import { validateScript } from "./validate";
-import { getFunctionReference } from "./grid-context";
+import { getFunctionReference, scopeWarnings } from "./grid-context";
+import { agent_activity } from "./agent-activity.store";
+
+interface ApprovalRequest {
+  targetLabel: string;
+  oldScript: string;
+  newScript: string;
+  warnings: string[];
+}
+
+/**
+ * Stage a write for explicit human approval: open the approval dialog and
+ * resolve only when the user decides (or closes the dialog — treated as a
+ * rejection). Nothing reaches a device until this resolves `approved: true`.
+ */
+function stageApproval(
+  request: ApprovalRequest,
+): Promise<{ approved: boolean }> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (approved: boolean) => {
+      if (!settled) {
+        settled = true;
+        resolve({ approved });
+      }
+    };
+    const win = new Modal.Window(AgentApproval as any);
+    win.show({
+      request,
+      decide: (approved: boolean) => done(approved),
+      onClosed: () => done(false),
+    });
+  });
+}
 
 interface AgentRequest {
   id: number;
@@ -113,6 +151,86 @@ async function handle(
       const limit = Number(params.limit ?? 15);
       const entries = get(lua_error_store) as unknown[];
       return entries.slice(-limit);
+    }
+
+    case "write_script": {
+      const { dx, dy, page = 0, element, event } = params;
+      const raw = String(params.script ?? "");
+      const rt = activeRuntime();
+      const ev = rt.findEvent(dx, dy, page, element, event);
+      if (!ev) {
+        throw new Error(
+          `Event not found: (${dx},${dy}) page ${page} element ${element} event ${event}.`,
+        );
+      }
+      const el = rt.findElement(dx, dy, page, element);
+      const scope: string | undefined = el?.type;
+
+      // Bare Lua has no action-block annotations; wrap it as a single code
+      // block so the runtime parser produces an action.
+      const normalized = /--\[\[@/.test(raw) ? raw : `--[[@cb]] ${raw}`;
+      const newActions = GridAction.parse(normalized);
+      if (newActions.length === 0) {
+        throw new Error(
+          "Script did not parse into any action blocks. Pass intech_lua, or the editor's --[[@short]] block form.",
+        );
+      }
+
+      // Server-side re-validation, independent of anything the agent asserts:
+      // re-run the real parser/length/forbidden check per action block.
+      const invalid = newActions
+        .map((a: any) => ({ short: a.short, ...validateScript(a.script) }))
+        .filter((b: any) => !b.ok);
+      if (invalid.length > 0) {
+        throw new Error(
+          "Validation failed: " +
+            invalid.map((b: any) => `[${b.short}] ${b.error}`).join("; "),
+        );
+      }
+
+      const targetLabel =
+        `module (${dx},${dy}) · page ${page} · element ${element}` +
+        ` (${scope ?? "?"}) · event ${event}`;
+      const oldScript = ev.toLua();
+      const warnings = scopeWarnings(raw, scope);
+
+      agent_activity.log({ kind: "write-proposed", target: targetLabel });
+
+      const decision = await stageApproval({
+        targetLabel,
+        oldScript,
+        newScript: normalized,
+        warnings,
+      });
+      if (!decision.approved) {
+        agent_activity.log({ kind: "write-rejected", target: targetLabel });
+        return {
+          applied: false,
+          reason: "Rejected by the user in the editor.",
+        };
+      }
+
+      try {
+        const current = [...ev.config];
+        if (current.length > 0) await ev.remove(...current);
+        await ev.insert(0, ...newActions);
+        await ev.sendToGrid();
+      } catch (e) {
+        const detail = e instanceof Error ? e.message : String(e);
+        agent_activity.log({
+          kind: "write-failed",
+          target: targetLabel,
+          detail,
+        });
+        throw new Error(`Apply failed: ${detail}`);
+      }
+
+      agent_activity.log({ kind: "write-applied", target: targetLabel });
+      logger.set({
+        type: "success",
+        message: `AI agent applied a script to element ${element}, event ${event}.`,
+      });
+      return { applied: true, target: { dx, dy, page, element, event } };
     }
 
     default:
