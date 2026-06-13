@@ -14,6 +14,7 @@
  *                                    | { id, ok: false, error }
  */
 import { get } from "svelte/store";
+import { mount } from "svelte";
 import { NumberToEventType, GridScript } from "@intechstudio/grid-protocol";
 import { runtime_manager } from "../runtime-manager.store";
 import { GridAction } from "../runtime";
@@ -24,9 +25,21 @@ import {
 } from "../../main/panels/DebugMonitor/DebugMonitor.store";
 import { Modal } from "../../main/modals/modal.store";
 import AgentApproval from "./AgentApproval.svelte";
+import AgentLauncher from "./AgentLauncher.svelte";
 import { validateScript } from "./validate";
 import { getFunctionReference, scopeWarnings } from "./grid-context";
 import { agent_activity } from "./agent-activity.store";
+
+// Mount the floating "Ask the agent" launcher once, when the bridge first
+// connects. Self-contained (appended to body) so it needs no layout changes.
+let launcherMounted = false;
+function ensureLauncher(): void {
+  if (launcherMounted || typeof document === "undefined") return;
+  launcherMounted = true;
+  const node = document.createElement("div");
+  document.body.appendChild(node);
+  mount(AgentLauncher, { target: node });
+}
 
 interface ApprovalRequest {
   title: string;
@@ -135,6 +148,47 @@ async function handle(
       }
       const el = rt.findElement(dx, dy, page, element);
       return { script, scope: el?.type, stored: ev.stored, state: ev.state };
+    }
+
+    case "dump_all": {
+      // Full config tree for the file-export workflow: every event's script
+      // across all modules/pages/elements, with element scope.
+      const rt = activeRuntime();
+      const modules = [];
+      for (const m of rt.modules) {
+        const mod: any = { dx: m.dx, dy: m.dy, type: m.type, pages: [] };
+        for (const p of m.pages ?? []) {
+          const page: any = { page: p.pageNumber, elements: [] };
+          for (const el of p.control_elements) {
+            const elem: any = {
+              element: el.elementIndex,
+              scope: el.type,
+              name: el.name,
+              events: [],
+            };
+            for (const ev of el.events) {
+              let script = ev.toLua();
+              if (!script && typeof ev.load === "function") {
+                try {
+                  await ev.load();
+                  script = ev.toLua();
+                } catch {
+                  /* leave empty */
+                }
+              }
+              elem.events.push({
+                event: ev.type,
+                name: NumberToEventType(ev.type),
+                script,
+              });
+            }
+            page.elements.push(elem);
+          }
+          mod.pages.push(page);
+        }
+        modules.push(mod);
+      }
+      return { modules };
     }
 
     case "get_function_reference":
@@ -321,6 +375,7 @@ export function setupAgentBridge(port: MessagePort): void {
     }
   };
   port.start?.();
+  ensureLauncher();
   // Let the package know the renderer side is live.
   port.postMessage({ type: "bridge-ready" });
 }

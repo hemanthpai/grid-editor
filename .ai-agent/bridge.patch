@@ -34,6 +34,65 @@ index a2ffd12..27910e2 100644
        default: {
          console.info(
            `Unhandled message type of ${
+diff --git a/src/renderer/runtime/agent/AgentActivity.svelte b/src/renderer/runtime/agent/AgentActivity.svelte
+new file mode 100644
+index 0000000..5e04325
+--- /dev/null
++++ b/src/renderer/runtime/agent/AgentActivity.svelte
+@@ -0,0 +1,53 @@
++<script lang="ts">
++  import { MoltenPushButton } from "@intechstudio/grid-uikit";
++  import MoltenModal from "../../main/modals/MoltenModal.svelte";
++  import { Modal } from "../../main/modals/modal.store";
++  import {
++    agent_activity,
++    type AgentActivityKind,
++  } from "./agent-activity.store";
++
++  export let data: Modal.Instance;
++
++  const KIND_LABEL: Record<AgentActivityKind, string> = {
++    "write-proposed": "proposed write",
++    "write-applied": "applied write",
++    "write-rejected": "rejected write",
++    "write-failed": "failed write",
++    "exec-proposed": "proposed run",
++    "exec-run": "ran on device",
++    "exec-rejected": "rejected run",
++    "exec-failed": "failed run",
++  };
++
++  function fmt(t: number): string {
++    return new Date(t).toLocaleTimeString();
++  }
++</script>
++
++<MoltenModal {data}>
++  <div slot="content" class="w-[36rem] max-w-full">
++    <p class="text-lg font-medium">AI agent activity</p>
++    {#if $agent_activity.length === 0}
++      <p class="pt-2 text-sm opacity-70">No agent activity yet.</p>
++    {:else}
++      <ul class="mt-2 flex max-h-96 flex-col gap-1 overflow-auto">
++        {#each [...$agent_activity].reverse() as e}
++          <li class="border-b border-white/10 py-1 text-sm">
++            <span class="opacity-60">{fmt(e.time)}</span>
++            <span class="font-medium">{KIND_LABEL[e.kind] ?? e.kind}</span>
++            — {e.target}
++            {#if e.detail}<span class="opacity-70"> — {e.detail}</span>{/if}
++          </li>
++        {/each}
++      </ul>
++    {/if}
++    <div class="flex justify-end pt-3">
++      <MoltenPushButton
++        click={() => data.close()}
++        text={"Close"}
++        style={"normal"}
++      />
++    </div>
++  </div>
++</MoltenModal>
 diff --git a/src/renderer/runtime/agent/AgentApproval.svelte b/src/renderer/runtime/agent/AgentApproval.svelte
 new file mode 100644
 index 0000000..4da9df9
@@ -130,6 +189,56 @@ index 0000000..4da9df9
 +    </div>
 +  </div>
 +</MoltenModal>
+diff --git a/src/renderer/runtime/agent/AgentLauncher.svelte b/src/renderer/runtime/agent/AgentLauncher.svelte
+new file mode 100644
+index 0000000..c811758
+--- /dev/null
++++ b/src/renderer/runtime/agent/AgentLauncher.svelte
+@@ -0,0 +1,44 @@
++<script lang="ts">
++  import { Modal } from "../../main/modals/modal.store";
++  import AgentActivity from "./AgentActivity.svelte";
++  import { agent_activity } from "./agent-activity.store";
++
++  // "Ask the agent" affordance: a small launcher that opens the activity feed.
++  function open() {
++    new Modal.Window(AgentActivity).show();
++  }
++</script>
++
++<button class="agent-launcher" on:click={open} title="AI agent activity">
++  🤖 Agent{#if $agent_activity.length}<span class="badge"
++      >{$agent_activity.length}</span
++    >{/if}
++</button>
++
++<style>
++  .agent-launcher {
++    position: fixed;
++    bottom: 12px;
++    right: 12px;
++    z-index: 40;
++    display: inline-flex;
++    align-items: center;
++    gap: 6px;
++    padding: 6px 10px;
++    border-radius: 8px;
++    font-size: 12px;
++    color: white;
++    background: rgba(0, 0, 0, 0.6);
++    border: 1px solid rgba(255, 255, 255, 0.2);
++    cursor: pointer;
++  }
++  .agent-launcher:hover {
++    background: rgba(0, 0, 0, 0.85);
++  }
++  .badge {
++    background: rgba(255, 255, 255, 0.18);
++    border-radius: 999px;
++    padding: 0 6px;
++    font-variant-numeric: tabular-nums;
++  }
++</style>
 diff --git a/src/renderer/runtime/agent/agent-activity.store.ts b/src/renderer/runtime/agent/agent-activity.store.ts
 new file mode 100644
 index 0000000..bfa3faf
@@ -177,10 +286,10 @@ index 0000000..bfa3faf
 +export const agent_activity = createActivity();
 diff --git a/src/renderer/runtime/agent/agent-bridge.ts b/src/renderer/runtime/agent/agent-bridge.ts
 new file mode 100644
-index 0000000..b06dbee
+index 0000000..524997b
 --- /dev/null
 +++ b/src/renderer/runtime/agent/agent-bridge.ts
-@@ -0,0 +1,326 @@
+@@ -0,0 +1,381 @@
 +/**
 + * Renderer-side AI agent bridge.
 + *
@@ -197,6 +306,7 @@ index 0000000..b06dbee
 + *                                    | { id, ok: false, error }
 + */
 +import { get } from "svelte/store";
++import { mount } from "svelte";
 +import { NumberToEventType, GridScript } from "@intechstudio/grid-protocol";
 +import { runtime_manager } from "../runtime-manager.store";
 +import { GridAction } from "../runtime";
@@ -207,9 +317,21 @@ index 0000000..b06dbee
 +} from "../../main/panels/DebugMonitor/DebugMonitor.store";
 +import { Modal } from "../../main/modals/modal.store";
 +import AgentApproval from "./AgentApproval.svelte";
++import AgentLauncher from "./AgentLauncher.svelte";
 +import { validateScript } from "./validate";
 +import { getFunctionReference, scopeWarnings } from "./grid-context";
 +import { agent_activity } from "./agent-activity.store";
++
++// Mount the floating "Ask the agent" launcher once, when the bridge first
++// connects. Self-contained (appended to body) so it needs no layout changes.
++let launcherMounted = false;
++function ensureLauncher(): void {
++  if (launcherMounted || typeof document === "undefined") return;
++  launcherMounted = true;
++  const node = document.createElement("div");
++  document.body.appendChild(node);
++  mount(AgentLauncher, { target: node });
++}
 +
 +interface ApprovalRequest {
 +  title: string;
@@ -318,6 +440,47 @@ index 0000000..b06dbee
 +      }
 +      const el = rt.findElement(dx, dy, page, element);
 +      return { script, scope: el?.type, stored: ev.stored, state: ev.state };
++    }
++
++    case "dump_all": {
++      // Full config tree for the file-export workflow: every event's script
++      // across all modules/pages/elements, with element scope.
++      const rt = activeRuntime();
++      const modules = [];
++      for (const m of rt.modules) {
++        const mod: any = { dx: m.dx, dy: m.dy, type: m.type, pages: [] };
++        for (const p of m.pages ?? []) {
++          const page: any = { page: p.pageNumber, elements: [] };
++          for (const el of p.control_elements) {
++            const elem: any = {
++              element: el.elementIndex,
++              scope: el.type,
++              name: el.name,
++              events: [],
++            };
++            for (const ev of el.events) {
++              let script = ev.toLua();
++              if (!script && typeof ev.load === "function") {
++                try {
++                  await ev.load();
++                  script = ev.toLua();
++                } catch {
++                  /* leave empty */
++                }
++              }
++              elem.events.push({
++                event: ev.type,
++                name: NumberToEventType(ev.type),
++                script,
++              });
++            }
++            page.elements.push(elem);
++          }
++          mod.pages.push(page);
++        }
++        modules.push(mod);
++      }
++      return { modules };
 +    }
 +
 +    case "get_function_reference":
@@ -504,6 +667,7 @@ index 0000000..b06dbee
 +    }
 +  };
 +  port.start?.();
++  ensureLauncher();
 +  // Let the package know the renderer side is live.
 +  port.postMessage({ type: "bridge-ready" });
 +}
