@@ -15,7 +15,11 @@
  */
 import { get } from "svelte/store";
 import { mount } from "svelte";
-import { NumberToEventType, GridScript } from "@intechstudio/grid-protocol";
+import {
+  NumberToEventType,
+  GridScript,
+  grid,
+} from "@intechstudio/grid-protocol";
 import { runtime_manager } from "../runtime-manager.store";
 import { GridAction } from "../runtime";
 import { logger } from "../runtime.store";
@@ -241,6 +245,20 @@ async function handle(
         throw new Error(
           "Validation failed: " +
             invalid.map((b: any) => `[${b.short}] ${b.error}`).join("; "),
+        );
+      }
+
+      // Fast length pre-check — mirror GridEvent.insert (write_script REPLACES
+      // the event, so the budget is the full cap). Fail before staging approval.
+      const cap = grid.getProperty("CONFIG_LENGTH");
+      const storedLength = newActions
+        .map((a: any) => a.toLua())
+        .join("").length;
+      if (storedLength >= cap) {
+        throw new Error(
+          `Script too long: stored form is ${storedLength} chars; the limit is ` +
+            `${cap - 1} (CONFIG_LENGTH ${cap}). The stored form includes ~10 chars of ` +
+            `per-block annotation. Shorten the script.`,
         );
       }
 

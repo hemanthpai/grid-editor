@@ -12,8 +12,9 @@ describe("validateScript", () => {
   test("accepts a simple valid statement", () => {
     const r = validateScript("local x = 1");
     expect(r.ok).toBe(true);
-    expect(r.compressedLength).toBeGreaterThan(0);
+    expect(r.expandedLength).toBeGreaterThan(0);
     expect(r.maxLength).toBeGreaterThan(0);
+    expect(r.maxUsable).toBe(r.maxLength - 1);
   });
 
   test("rejects a syntax error", () => {
@@ -22,12 +23,19 @@ describe("validateScript", () => {
     expect(r.error).toBeTruthy();
   });
 
-  test("rejects over-length scripts", () => {
+  test("rejects over-length scripts on the expanded (stored) axis", () => {
     const max = grid.getProperty("CONFIG_LENGTH");
-    const big = "a=1;".repeat(max); // well over the cap
+    const big = "a=1;".repeat(max); // stored form well over the cap
     const r = validateScript(big);
     expect(r.ok).toBe(false);
+    expect(r.expandedLength).toBeGreaterThanOrEqual(max);
     expect(r.error).toMatch(/too long/i);
+  });
+
+  test("counts the code-block annotation overhead in expandedLength", () => {
+    const r = validateScript("x=1");
+    // stored as "--[[@cb]] x=1" -> 10 (prefix) + 3
+    expect(r.expandedLength).toBe(13);
   });
 
   test("rejects forbidden identifiers", () => {

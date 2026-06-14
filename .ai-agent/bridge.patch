@@ -286,10 +286,10 @@ index 0000000..bfa3faf
 +export const agent_activity = createActivity();
 diff --git a/src/renderer/runtime/agent/agent-bridge.ts b/src/renderer/runtime/agent/agent-bridge.ts
 new file mode 100644
-index 0000000..524997b
+index 0000000..c302701
 --- /dev/null
 +++ b/src/renderer/runtime/agent/agent-bridge.ts
-@@ -0,0 +1,381 @@
+@@ -0,0 +1,399 @@
 +/**
 + * Renderer-side AI agent bridge.
 + *
@@ -307,7 +307,11 @@ index 0000000..524997b
 + */
 +import { get } from "svelte/store";
 +import { mount } from "svelte";
-+import { NumberToEventType, GridScript } from "@intechstudio/grid-protocol";
++import {
++  NumberToEventType,
++  GridScript,
++  grid,
++} from "@intechstudio/grid-protocol";
 +import { runtime_manager } from "../runtime-manager.store";
 +import { GridAction } from "../runtime";
 +import { logger } from "../runtime.store";
@@ -533,6 +537,20 @@ index 0000000..524997b
 +        throw new Error(
 +          "Validation failed: " +
 +            invalid.map((b: any) => `[${b.short}] ${b.error}`).join("; "),
++        );
++      }
++
++      // Fast length pre-check — mirror GridEvent.insert (write_script REPLACES
++      // the event, so the budget is the full cap). Fail before staging approval.
++      const cap = grid.getProperty("CONFIG_LENGTH");
++      const storedLength = newActions
++        .map((a: any) => a.toLua())
++        .join("").length;
++      if (storedLength >= cap) {
++        throw new Error(
++          `Script too long: stored form is ${storedLength} chars; the limit is ` +
++            `${cap - 1} (CONFIG_LENGTH ${cap}). The stored form includes ~10 chars of ` +
++            `per-block annotation. Shorten the script.`,
 +        );
 +      }
 +
@@ -815,10 +833,10 @@ index 0000000..39a4d63
 +}
 diff --git a/src/renderer/runtime/agent/validate.test.ts b/src/renderer/runtime/agent/validate.test.ts
 new file mode 100644
-index 0000000..0dde699
+index 0000000..2b0acf3
 --- /dev/null
 +++ b/src/renderer/runtime/agent/validate.test.ts
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,48 @@
 +import { test, expect, beforeAll, describe } from "vitest";
 +import { initLuaFormatter, grid } from "@intechstudio/grid-protocol";
 +import { validateScript } from "./validate";
@@ -833,8 +851,9 @@ index 0000000..0dde699
 +  test("accepts a simple valid statement", () => {
 +    const r = validateScript("local x = 1");
 +    expect(r.ok).toBe(true);
-+    expect(r.compressedLength).toBeGreaterThan(0);
++    expect(r.expandedLength).toBeGreaterThan(0);
 +    expect(r.maxLength).toBeGreaterThan(0);
++    expect(r.maxUsable).toBe(r.maxLength - 1);
 +  });
 +
 +  test("rejects a syntax error", () => {
@@ -843,12 +862,19 @@ index 0000000..0dde699
 +    expect(r.error).toBeTruthy();
 +  });
 +
-+  test("rejects over-length scripts", () => {
++  test("rejects over-length scripts on the expanded (stored) axis", () => {
 +    const max = grid.getProperty("CONFIG_LENGTH");
-+    const big = "a=1;".repeat(max); // well over the cap
++    const big = "a=1;".repeat(max); // stored form well over the cap
 +    const r = validateScript(big);
 +    expect(r.ok).toBe(false);
++    expect(r.expandedLength).toBeGreaterThanOrEqual(max);
 +    expect(r.error).toMatch(/too long/i);
++  });
++
++  test("counts the code-block annotation overhead in expandedLength", () => {
++    const r = validateScript("x=1");
++    // stored as "--[[@cb]] x=1" -> 10 (prefix) + 3
++    expect(r.expandedLength).toBe(13);
 +  });
 +
 +  test("rejects forbidden identifiers", () => {
@@ -861,29 +887,43 @@ index 0000000..0dde699
 +});
 diff --git a/src/renderer/runtime/agent/validate.ts b/src/renderer/runtime/agent/validate.ts
 new file mode 100644
-index 0000000..5bb4706
+index 0000000..f83b3e0
 --- /dev/null
 +++ b/src/renderer/runtime/agent/validate.ts
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,119 @@
 +/**
 + * Shared intech_lua validator for the AI agent bridge.
 + *
-+ * Mirrors the validate + length + forbidden-identifier logic that
-+ * Monaco.svelte / monaco.ts apply when editing a script, so the agent's
-+ * validate_script loop uses the SAME real parser the editor does. Read-only —
-+ * never touches hardware.
++ * The device/editor constraint is on the **expanded, stored** form of the whole
++ * event — the editor rejects when `event.toLua().length >= CONFIG_LENGTH`
++ * (Monaco.svelte) and `GridEvent.insert` enforces the same via getAvailableChars.
++ * The stored form wraps bare Lua as a `--[[@cb]] <script>` code block, so each
++ * block carries ~10 chars of annotation overhead that count toward the cap.
++ *
++ * We therefore validate on EXPANDED length (matching the editor + the apply
++ * path), not compressed length. Compressed length is still reported for info.
++ * Read-only — never touches hardware.
 + */
 +import { GridScript, grid } from "@intechstudio/grid-protocol";
 +
-+/** Hard cap on a config's length (same source the editor uses). */
++/** Hard cap on a config's length (same source the editor uses): CONFIG_LENGTH. */
 +function maxScriptLength(): number {
 +  return grid.getProperty("CONFIG_LENGTH");
 +}
 +
++/** A bare script is stored as a single code block with this prefix. */
++const CODE_BLOCK_PREFIX = "--[[@cb]] ";
++
 +export interface ValidateResult {
 +  ok: boolean;
++  /** Length of the stored (expanded) form — the axis the editor/device enforce. */
++  expandedLength: number;
++  /** Device-compressed length (informational only). */
 +  compressedLength?: number;
++  /** CONFIG_LENGTH. */
 +  maxLength: number;
++  /** Largest accepted expandedLength (maxLength - 1). */
++  maxUsable: number;
 +  error?: string;
 +  forbidden?: string[];
 +}
@@ -910,29 +950,48 @@ index 0000000..5bb4706
 +  );
 +}
 +
++const ANNOTATED = /--\[\[@/;
++
 +export function validateScript(script: string): ValidateResult {
 +  const maxLength = maxScriptLength();
++  const maxUsable = maxLength - 1;
++
++  // Stored (expanded) form: bare Lua becomes one code block; already-annotated
++  // multi-block scripts are stored as-is.
++  const stored = ANNOTATED.test(script) ? script : CODE_BLOCK_PREFIX + script;
++  const expandedLength = stored.length;
++
 +  const hits = findForbidden(script);
 +
-+  let compressed: string;
++  // Syntax check via the real parser. Strip any block annotations first so the
++  // concatenated code is plain Lua the compressor can parse.
++  const codeOnly = script.replace(/--\[\[@.*?\]\]/gs, " ");
++  let compressedLength: number | undefined;
 +  try {
-+    compressed = GridScript.compressScript(script);
++    compressedLength = GridScript.compressScript(codeOnly).length;
 +  } catch (e) {
 +    return {
 +      ok: false,
++      expandedLength,
 +      maxLength,
++      maxUsable,
 +      error: e instanceof Error ? e.message : String(e),
 +      forbidden: hits.length ? hits : undefined,
 +    };
 +  }
 +
-+  const compressedLength = compressed.length;
-+  if (compressedLength >= maxLength) {
++  // The editor rejects at `>= maxLength` on the expanded stored form.
++  if (expandedLength >= maxLength) {
 +    return {
 +      ok: false,
++      expandedLength,
 +      compressedLength,
 +      maxLength,
-+      error: `Script too long: compressed length ${compressedLength} >= limit ${maxLength}.`,
++      maxUsable,
++      error:
++        `Script too long: stored form is ${expandedLength} chars; the limit is ` +
++        `${maxUsable} (CONFIG_LENGTH ${maxLength}). Note the stored form includes ` +
++        `~10 chars of per-block annotation. Shorten the script.`,
 +      forbidden: hits.length ? hits : undefined,
 +    };
 +  }
@@ -940,12 +999,14 @@ index 0000000..5bb4706
 +  if (hits.length) {
 +    return {
 +      ok: false,
++      expandedLength,
 +      compressedLength,
 +      maxLength,
++      maxUsable,
 +      error: `Uses forbidden identifier(s): ${hits.join(", ")}.`,
 +      forbidden: hits,
 +    };
 +  }
 +
-+  return { ok: true, compressedLength, maxLength };
++  return { ok: true, expandedLength, compressedLength, maxLength, maxUsable };
 +}
