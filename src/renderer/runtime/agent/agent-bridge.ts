@@ -223,6 +223,19 @@ async function handle(
           `Event not found: (${dx},${dy}) page ${page} element ${element} event ${event}.`,
         );
       }
+
+      // Fetch the event from the device first. An unloaded event has empty/stale
+      // config AND GridEvent.sendToGrid() silently no-ops on it (returns success
+      // without transmitting), so the change would never reach the device and a
+      // later Store would persist the OLD config. load() is idempotent.
+      if (typeof ev.load === "function") {
+        try {
+          await ev.load();
+        } catch {
+          /* the post-send transmit check below will catch a non-transmit */
+        }
+      }
+
       const el = rt.findElement(dx, dy, page, element);
       const scope: string | undefined = el?.type;
 
@@ -290,7 +303,18 @@ async function handle(
         const current = [...ev.config];
         if (current.length > 0) await ev.remove(...current);
         await ev.insert(0, ...newActions);
-        await ev.sendToGrid();
+        const sync: any = await ev.sendToGrid();
+        // sendToGrid resolves value:true even when it transmits nothing (event
+        // not loaded / invalid). Treat a non-transmit as a real failure so we
+        // never report success for a change the device never received.
+        const text = String(sync?.text ?? "");
+        if (!sync?.value || /nothing to sync/i.test(text)) {
+          throw new Error(
+            `the editor did not transmit the config to the device${
+              text ? ` (${text})` : ""
+            }`,
+          );
+        }
       } catch (e) {
         const detail = e instanceof Error ? e.message : String(e);
         agent_activity.log({
@@ -304,9 +328,13 @@ async function handle(
       agent_activity.log({ kind: "write-applied", target: targetLabel });
       logger.set({
         type: "success",
-        message: `AI agent applied a script to element ${element}, event ${event}.`,
+        message: `AI agent applied a script to element ${element}, event ${event}. Click Store to persist it.`,
       });
-      return { applied: true, target: { dx, dy, page, element, event } };
+      return {
+        applied: true,
+        target: { dx, dy, page, element, event },
+        note: "Synced to the device (live). Persisting to the module's memory requires clicking Store in the editor.",
+      };
     }
 
     case "send_immediate": {
