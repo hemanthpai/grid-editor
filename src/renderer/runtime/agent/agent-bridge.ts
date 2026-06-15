@@ -6,8 +6,9 @@
  * This module answers structured queries that arrive over the MessagePort the
  * package opens to us (see App.svelte's "agent-bridge-ready" handler). Read /
  * observe / validate methods are unguarded. The mutating methods (write_script,
- * send_immediate) re-validate server-side and then stage the change for explicit
- * human approval (stageApproval) — nothing reaches a device without it.
+ * send_immediate) re-validate server-side and then apply immediately (auto-apply)
+ * — server-side validation is the gate, and changes are only persisted to the
+ * module's memory when the user clicks Store in the editor.
  *
  * Wire protocol (package -> renderer): { id, method, params }
  *               (renderer -> package): { id, ok: true, result }
@@ -27,11 +28,9 @@ import {
   debug_monitor_store,
   lua_error_store,
 } from "../../main/panels/DebugMonitor/DebugMonitor.store";
-import { Modal } from "../../main/modals/modal.store";
-import AgentApproval from "./AgentApproval.svelte";
 import AgentLauncher from "./AgentLauncher.svelte";
 import { validateScript } from "./validate";
-import { getFunctionReference, scopeWarnings } from "./grid-context";
+import { getFunctionReference } from "./grid-context";
 import { agent_activity } from "./agent-activity.store";
 
 // Mount the floating "Ask the agent" launcher once, when the bridge first
@@ -43,40 +42,6 @@ function ensureLauncher(): void {
   const node = document.createElement("div");
   document.body.appendChild(node);
   mount(AgentLauncher, { target: node });
-}
-
-interface ApprovalRequest {
-  title: string;
-  targetLabel: string;
-  oldScript?: string;
-  newScript: string;
-  warnings: string[];
-  approveLabel: string;
-}
-
-/**
- * Stage a write for explicit human approval: open the approval dialog and
- * resolve only when the user decides (or closes the dialog — treated as a
- * rejection). Nothing reaches a device until this resolves `approved: true`.
- */
-function stageApproval(
-  request: ApprovalRequest,
-): Promise<{ approved: boolean }> {
-  return new Promise((resolve) => {
-    let settled = false;
-    const done = (approved: boolean) => {
-      if (!settled) {
-        settled = true;
-        resolve({ approved });
-      }
-    };
-    const win = new Modal.Window(AgentApproval as any);
-    win.show({
-      request,
-      decide: (approved: boolean) => done(approved),
-      onClosed: () => done(false),
-    });
-  });
 }
 
 interface AgentRequest {
@@ -278,27 +243,9 @@ async function handle(
       const targetLabel =
         `module (${dx},${dy}) · page ${page} · element ${element}` +
         ` (${scope ?? "?"}) · event ${event}`;
-      const oldScript = ev.toLua();
-      const warnings = scopeWarnings(raw, scope);
 
-      agent_activity.log({ kind: "write-proposed", target: targetLabel });
-
-      const decision = await stageApproval({
-        title: "AI agent wants to write a script",
-        targetLabel,
-        oldScript,
-        newScript: normalized,
-        warnings,
-        approveLabel: "Approve & apply",
-      });
-      if (!decision.approved) {
-        agent_activity.log({ kind: "write-rejected", target: targetLabel });
-        return {
-          applied: false,
-          reason: "Rejected by the user in the editor.",
-        };
-      }
-
+      // Auto-apply: server-side validation above is the gate; the change is
+      // synced live and only persisted when the user clicks Store.
       try {
         const current = [...ev.config];
         if (current.length > 0) await ev.remove(...current);
@@ -354,23 +301,7 @@ async function handle(
           ? "all connected modules"
           : `module (${dx},${dy})`;
 
-      agent_activity.log({ kind: "exec-proposed", target: targetLabel });
-
-      const decision = await stageApproval({
-        title: "AI agent wants to run Lua on the device",
-        targetLabel,
-        newScript: raw, // no diff — this is a one-off execution
-        warnings: [],
-        approveLabel: "Approve & run",
-      });
-      if (!decision.approved) {
-        agent_activity.log({ kind: "exec-rejected", target: targetLabel });
-        return {
-          executed: false,
-          reason: "Rejected by the user in the editor.",
-        };
-      }
-
+      // Auto-apply: validation above is the gate; run the one-off immediately.
       try {
         // LUAExecImmediate compresses + sends SendConfigImmediate to the device.
         runtime_manager.LUAExecImmediate(dx, dy, raw);

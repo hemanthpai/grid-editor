@@ -36,10 +36,10 @@ index a2ffd12..27910e2 100644
            `Unhandled message type of ${
 diff --git a/src/renderer/runtime/agent/AgentActivity.svelte b/src/renderer/runtime/agent/AgentActivity.svelte
 new file mode 100644
-index 0000000..5e04325
+index 0000000..0d16f53
 --- /dev/null
 +++ b/src/renderer/runtime/agent/AgentActivity.svelte
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,49 @@
 +<script lang="ts">
 +  import { MoltenPushButton } from "@intechstudio/grid-uikit";
 +  import MoltenModal from "../../main/modals/MoltenModal.svelte";
@@ -52,13 +52,9 @@ index 0000000..5e04325
 +  export let data: Modal.Instance;
 +
 +  const KIND_LABEL: Record<AgentActivityKind, string> = {
-+    "write-proposed": "proposed write",
 +    "write-applied": "applied write",
-+    "write-rejected": "rejected write",
 +    "write-failed": "failed write",
-+    "exec-proposed": "proposed run",
 +    "exec-run": "ran on device",
-+    "exec-rejected": "rejected run",
 +    "exec-failed": "failed run",
 +  };
 +
@@ -89,102 +85,6 @@ index 0000000..5e04325
 +        click={() => data.close()}
 +        text={"Close"}
 +        style={"normal"}
-+      />
-+    </div>
-+  </div>
-+</MoltenModal>
-diff --git a/src/renderer/runtime/agent/AgentApproval.svelte b/src/renderer/runtime/agent/AgentApproval.svelte
-new file mode 100644
-index 0000000..4da9df9
---- /dev/null
-+++ b/src/renderer/runtime/agent/AgentApproval.svelte
-@@ -0,0 +1,90 @@
-+<script lang="ts">
-+  import { MoltenPushButton } from "@intechstudio/grid-uikit";
-+  import MoltenModal from "../../main/modals/MoltenModal.svelte";
-+  import { Modal } from "../../main/modals/modal.store";
-+  import { onDestroy } from "svelte";
-+
-+  // Provided by Modal.Window.show():
-+  export let data: Modal.Instance;
-+  export let request: {
-+    title: string;
-+    targetLabel: string;
-+    // When present, render a before/after diff; otherwise just show the script.
-+    oldScript?: string;
-+    newScript: string;
-+    warnings: string[];
-+    approveLabel: string;
-+  };
-+  // Called with the human's decision.
-+  export let decide: (approved: boolean) => void;
-+  // Called if the dialog closes without an explicit decision (escape / click-out).
-+  export let onClosed: () => void = () => {};
-+
-+  let acted = false;
-+
-+  function approve() {
-+    acted = true;
-+    decide(true);
-+    data.close();
-+  }
-+  function reject() {
-+    acted = true;
-+    decide(false);
-+    data.close();
-+  }
-+
-+  onDestroy(() => {
-+    if (!acted) onClosed();
-+  });
-+</script>
-+
-+<MoltenModal {data}>
-+  <div slot="content" class="w-[40rem] max-w-full">
-+    <p class="text-lg font-medium">{request.title}</p>
-+    <p class="pt-1 text-sm opacity-70">{request.targetLabel}</p>
-+
-+    {#if request.warnings.length}
-+      <div
-+        class="mt-3 rounded border border-yellow-500/50 bg-yellow-500/10 p-2 text-sm"
-+      >
-+        <p class="font-medium">Scope warnings</p>
-+        <ul class="list-disc pl-5">
-+          {#each request.warnings as w}
-+            <li>{w}</li>
-+          {/each}
-+        </ul>
-+      </div>
-+    {/if}
-+
-+    <div class="mt-3 flex flex-col gap-3">
-+      {#if request.oldScript !== undefined}
-+        <div>
-+          <p class="text-xs uppercase opacity-60">Current</p>
-+          <pre
-+            class="max-h-40 overflow-auto rounded bg-black/30 p-2 text-xs whitespace-pre-wrap">{request.oldScript ||
-+              "(empty)"}</pre>
-+        </div>
-+        <div>
-+          <p class="text-xs uppercase opacity-60">Proposed</p>
-+          <pre
-+            class="max-h-40 overflow-auto rounded bg-black/30 p-2 text-xs whitespace-pre-wrap">{request.newScript}</pre>
-+        </div>
-+      {:else}
-+        <div>
-+          <p class="text-xs uppercase opacity-60">Will run on device</p>
-+          <pre
-+            class="max-h-40 overflow-auto rounded bg-black/30 p-2 text-xs whitespace-pre-wrap">{request.newScript}</pre>
-+        </div>
-+      {/if}
-+    </div>
-+
-+    <div class="flex flex-row justify-end pt-3 items-center gap-2">
-+      <MoltenPushButton click={reject} text={"Reject"} style={"normal"} />
-+      <MoltenPushButton
-+        click={approve}
-+        text={request.approveLabel}
-+        style={"accept"}
 +      />
 +    </div>
 +  </div>
@@ -241,10 +141,10 @@ index 0000000..c811758
 +</style>
 diff --git a/src/renderer/runtime/agent/agent-activity.store.ts b/src/renderer/runtime/agent/agent-activity.store.ts
 new file mode 100644
-index 0000000..bfa3faf
+index 0000000..3bcf5fa
 --- /dev/null
 +++ b/src/renderer/runtime/agent/agent-activity.store.ts
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,35 @@
 +/**
 + * In-app activity feed for AI-agent mutations. Every guarded write the agent
 + * proposes is logged here (proposed / applied / rejected / failed) so the user
@@ -254,13 +154,9 @@ index 0000000..bfa3faf
 +import { writable } from "svelte/store";
 +
 +export type AgentActivityKind =
-+  | "write-proposed"
 +  | "write-applied"
-+  | "write-rejected"
 +  | "write-failed"
-+  | "exec-proposed"
 +  | "exec-run"
-+  | "exec-rejected"
 +  | "exec-failed";
 +
 +export interface AgentActivityEntry {
@@ -286,10 +182,10 @@ index 0000000..bfa3faf
 +export const agent_activity = createActivity();
 diff --git a/src/renderer/runtime/agent/agent-bridge.ts b/src/renderer/runtime/agent/agent-bridge.ts
 new file mode 100644
-index 0000000..44f2472
+index 0000000..b61e887
 --- /dev/null
 +++ b/src/renderer/runtime/agent/agent-bridge.ts
-@@ -0,0 +1,427 @@
+@@ -0,0 +1,358 @@
 +/**
 + * Renderer-side AI agent bridge.
 + *
@@ -298,8 +194,9 @@ index 0000000..44f2472
 + * This module answers structured queries that arrive over the MessagePort the
 + * package opens to us (see App.svelte's "agent-bridge-ready" handler). Read /
 + * observe / validate methods are unguarded. The mutating methods (write_script,
-+ * send_immediate) re-validate server-side and then stage the change for explicit
-+ * human approval (stageApproval) — nothing reaches a device without it.
++ * send_immediate) re-validate server-side and then apply immediately (auto-apply)
++ * — server-side validation is the gate, and changes are only persisted to the
++ * module's memory when the user clicks Store in the editor.
 + *
 + * Wire protocol (package -> renderer): { id, method, params }
 + *               (renderer -> package): { id, ok: true, result }
@@ -319,11 +216,9 @@ index 0000000..44f2472
 +  debug_monitor_store,
 +  lua_error_store,
 +} from "../../main/panels/DebugMonitor/DebugMonitor.store";
-+import { Modal } from "../../main/modals/modal.store";
-+import AgentApproval from "./AgentApproval.svelte";
 +import AgentLauncher from "./AgentLauncher.svelte";
 +import { validateScript } from "./validate";
-+import { getFunctionReference, scopeWarnings } from "./grid-context";
++import { getFunctionReference } from "./grid-context";
 +import { agent_activity } from "./agent-activity.store";
 +
 +// Mount the floating "Ask the agent" launcher once, when the bridge first
@@ -335,40 +230,6 @@ index 0000000..44f2472
 +  const node = document.createElement("div");
 +  document.body.appendChild(node);
 +  mount(AgentLauncher, { target: node });
-+}
-+
-+interface ApprovalRequest {
-+  title: string;
-+  targetLabel: string;
-+  oldScript?: string;
-+  newScript: string;
-+  warnings: string[];
-+  approveLabel: string;
-+}
-+
-+/**
-+ * Stage a write for explicit human approval: open the approval dialog and
-+ * resolve only when the user decides (or closes the dialog — treated as a
-+ * rejection). Nothing reaches a device until this resolves `approved: true`.
-+ */
-+function stageApproval(
-+  request: ApprovalRequest,
-+): Promise<{ approved: boolean }> {
-+  return new Promise((resolve) => {
-+    let settled = false;
-+    const done = (approved: boolean) => {
-+      if (!settled) {
-+        settled = true;
-+        resolve({ approved });
-+      }
-+    };
-+    const win = new Modal.Window(AgentApproval as any);
-+    win.show({
-+      request,
-+      decide: (approved: boolean) => done(approved),
-+      onClosed: () => done(false),
-+    });
-+  });
 +}
 +
 +interface AgentRequest {
@@ -570,27 +431,9 @@ index 0000000..44f2472
 +      const targetLabel =
 +        `module (${dx},${dy}) · page ${page} · element ${element}` +
 +        ` (${scope ?? "?"}) · event ${event}`;
-+      const oldScript = ev.toLua();
-+      const warnings = scopeWarnings(raw, scope);
 +
-+      agent_activity.log({ kind: "write-proposed", target: targetLabel });
-+
-+      const decision = await stageApproval({
-+        title: "AI agent wants to write a script",
-+        targetLabel,
-+        oldScript,
-+        newScript: normalized,
-+        warnings,
-+        approveLabel: "Approve & apply",
-+      });
-+      if (!decision.approved) {
-+        agent_activity.log({ kind: "write-rejected", target: targetLabel });
-+        return {
-+          applied: false,
-+          reason: "Rejected by the user in the editor.",
-+        };
-+      }
-+
++      // Auto-apply: server-side validation above is the gate; the change is
++      // synced live and only persisted when the user clicks Store.
 +      try {
 +        const current = [...ev.config];
 +        if (current.length > 0) await ev.remove(...current);
@@ -646,23 +489,7 @@ index 0000000..44f2472
 +          ? "all connected modules"
 +          : `module (${dx},${dy})`;
 +
-+      agent_activity.log({ kind: "exec-proposed", target: targetLabel });
-+
-+      const decision = await stageApproval({
-+        title: "AI agent wants to run Lua on the device",
-+        targetLabel,
-+        newScript: raw, // no diff — this is a one-off execution
-+        warnings: [],
-+        approveLabel: "Approve & run",
-+      });
-+      if (!decision.approved) {
-+        agent_activity.log({ kind: "exec-rejected", target: targetLabel });
-+        return {
-+          executed: false,
-+          reason: "Rejected by the user in the editor.",
-+        };
-+      }
-+
++      // Auto-apply: validation above is the gate; run the one-off immediately.
 +      try {
 +        // LUAExecImmediate compresses + sends SendConfigImmediate to the device.
 +        runtime_manager.LUAExecImmediate(dx, dy, raw);

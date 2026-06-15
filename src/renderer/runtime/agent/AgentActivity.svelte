@@ -10,13 +10,9 @@
   export let data: Modal.Instance;
 
   const KIND_LABEL: Record<AgentActivityKind, string> = {
-    "write-proposed": "proposed write",
     "write-applied": "applied write",
-    "write-rejected": "rejected write",
     "write-failed": "failed write",
-    "exec-proposed": "proposed run",
     "exec-run": "ran on device",
-    "exec-rejected": "rejected run",
     "exec-failed": "failed run",
   };
 
