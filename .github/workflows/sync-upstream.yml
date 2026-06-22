@@ -1,0 +1,120 @@
+name: Sync with upstream
+
+# Keeps the `ai-agent-bridge` overlay current with intechstudio/grid-editor
+# `stable`. Rebuilds the branch as (upstream/stable + .ai-agent/bridge.patch),
+# auto-resolving the App.svelte hunk via a 3-way apply. Auto-pushes when it
+# applies and builds; otherwise opens a PR (build red) or an issue (conflict).
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  OVERLAY_BRANCH: ai-agent-bridge
+  UPSTREAM_REPO: https://github.com/intechstudio/grid-editor.git
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout overlay branch
+        uses: actions/checkout@v4
+        with:
+          ref: ai-agent-bridge
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git + upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch --no-tags upstream stable
+
+      - name: Detect upstream changes
+        id: check
+        run: |
+          UP=$(git rev-parse upstream/stable)
+          BASE=$(git merge-base HEAD upstream/stable)
+          echo "upstream=$UP" >> "$GITHUB_OUTPUT"
+          echo "upstream_short=$(git rev-parse --short upstream/stable)" >> "$GITHUB_OUTPUT"
+          if [ "$UP" = "$BASE" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Overlay already sits on upstream/stable ($UP) — nothing to do."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream advanced to $UP (overlay base $BASE)."
+          fi
+
+      - name: Rebuild overlay on latest upstream
+        id: rebuild
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set +e
+          # Stash our meta files (patch + workflow + docs) before switching trees.
+          cp .ai-agent/bridge.patch /tmp/bridge.patch
+          git checkout -B auto/upstream-sync upstream/stable
+          # Restore the non-upstream meta files from the overlay branch.
+          git checkout "$OVERLAY_BRANCH" -- .ai-agent .github/workflows/sync-upstream.yml
+          # Re-apply the source overlay with a 3-way merge (the auto-fixer).
+          git apply --3way --whitespace=nowarn /tmp/bridge.patch
+          if [ $? -ne 0 ]; then
+            echo "apply=failed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "apply=ok" >> "$GITHUB_OUTPUT"
+          git add -A
+          git commit -m "sync: rebuild AI agent overlay on upstream/stable ${{ steps.check.outputs.upstream_short }}"
+
+      - name: Set up Node
+        if: steps.rebuild.outputs.apply == 'ok'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Build gate
+        id: build
+        if: steps.rebuild.outputs.apply == 'ok'
+        run: |
+          set +e
+          npm ci || { echo "build=failed" >> "$GITHUB_OUTPUT"; exit 0; }
+          npm run s:build || { echo "build=failed" >> "$GITHUB_OUTPUT"; exit 0; }
+          echo "build=ok" >> "$GITHUB_OUTPUT"
+
+      - name: Promote (applies + builds) — auto
+        if: steps.rebuild.outputs.apply == 'ok' && steps.build.outputs.build == 'ok'
+        run: |
+          git push --force-with-lease origin "auto/upstream-sync:${OVERLAY_BRANCH}"
+          echo "::notice::Synced ${OVERLAY_BRANCH} to upstream/stable ${{ steps.check.outputs.upstream_short }} (clean apply + green build)."
+
+      - name: Open PR (applies but build red) — review
+        if: steps.rebuild.outputs.apply == 'ok' && steps.build.outputs.build == 'failed'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git push --force-with-lease origin auto/upstream-sync
+          gh pr create \
+            --base "$OVERLAY_BRANCH" --head auto/upstream-sync \
+            --title "⚠️ Upstream sync (${{ steps.check.outputs.upstream_short }}) — build red, review needed" \
+            --body "The overlay re-applied cleanly onto upstream/stable \`${{ steps.check.outputs.upstream }}\`, but \`npm run s:build\` failed. Upstream likely changed an API the agent bridge depends on. Review the build logs, fix the bridge, regenerate \`.ai-agent/bridge.patch\`, then merge." \
+            2>/dev/null || gh pr edit auto/upstream-sync --title "⚠️ Upstream sync (${{ steps.check.outputs.upstream_short }}) — build red, review needed"
+
+      - name: Open issue (cannot auto-apply) — manual
+        if: steps.rebuild.outputs.apply == 'failed'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "Upstream sync needs manual conflict resolution (${{ steps.check.outputs.upstream_short }})" \
+            --body "Re-applying \`.ai-agent/bridge.patch\` onto upstream/stable \`${{ steps.check.outputs.upstream }}\` failed even with a 3-way merge — upstream moved the code the App.svelte hook anchors to. Resolve manually: check out upstream/stable, re-apply the overlay by hand, run \`.ai-agent/regenerate-patch.sh\`, and push \`$OVERLAY_BRANCH\`. The branch was left untouched." \
+            || echo "issue create failed (maybe one already open)"

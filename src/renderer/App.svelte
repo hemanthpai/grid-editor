@@ -44,6 +44,7 @@
   import "redefine-custom-elements";
   import { runtime_manager } from "./runtime/runtime-manager.store";
   import { get } from "svelte/store";
+  import { setupAgentBridge } from "./runtime/agent/agent-bridge";
 
   let shapeSelected;
   let colorSelected;
@@ -241,6 +242,23 @@
       }
       case "debug-error": {
         console.log(`Package error: ${JSON.stringify(data)}`);
+        break;
+      }
+      case "agent-bridge-ready": {
+        // The AI agent package (package-ai-agent) asks us to open a direct
+        // MessagePort so its MCP server can answer read-only runtime queries.
+        if (typeof window.createPackageMessagePort === "function") {
+          const targetId = data.packageId ?? "package-ai-agent";
+          const port = window.createPackageMessagePort(
+            targetId,
+            "agent-bridge",
+          );
+          setupAgentBridge(port);
+        } else {
+          console.warn(
+            "agent-bridge-ready received before createPackageMessagePort was ready",
+          );
+        }
         break;
       }
       default: {
